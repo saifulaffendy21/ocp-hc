@@ -101,14 +101,6 @@ strip_colors() {
 
 # --- Diagnostic Helpers ---
 
-print_etcd_api_health() {
-    print_sub_header "API Server etcd Health Endpoints"
-    $KUBE_CMD get --raw='/healthz/etcd' 2>/dev/null || \
-        echo -e "${STATUS_WARN} /healthz/etcd not available (RBAC or API endpoint not supported)."
-    $KUBE_CMD get --raw='/readyz?verbose' 2>/dev/null | grep -i etcd || \
-        echo -e "${STATUS_WARN} /readyz etcd checks not available (RBAC or API endpoint not supported)."
-}
-
 print_etcd_operator_status() {
     if [ "$IS_OPENSHIFT" = true ]; then
         print_sub_header "OpenShift Etcd Operator Status"
@@ -181,8 +173,8 @@ print_loki_status() {
         return
     fi
 
-    $KUBE_CMD get pods -n openshift-logging -l component=loki -o wide 2>/dev/null || \
-        echo -e "${STATUS_WARN} Unable to list Loki pods."
+    $KUBE_CMD get pods -n openshift-logging -o wide 2>/dev/null || \
+        echo -e "${STATUS_WARN} Unable to list logging pods."
 }
 
 print_volumesnapshot_older_than_week() {
@@ -247,9 +239,30 @@ run_snapshot() {
     echo -e "Total Pods: ${BOLD}${TOTAL_PODS}${NC} | Not Running/Completed: ${RED}${BOLD}${NOT_READY_PODS}${NC}"
 
     print_sub_header "Deployments/StatefulSets/DaemonSets not at desired state"
-    $KUBE_CMD get deploy,sts,ds -A -o wide 2>/dev/null | \
-        awk '$2 != $3 &&NR>1 {print $0}' || \
-        echo -e "${STATUS_OK} All major workloads appear balanced."
+    echo -e "NAMESPACE\tKIND\tNAME\tREADY\tSPEC"
+    {
+        $KUBE_CMD get deploy -A -o custom-columns=\
+NAMESPACE:.metadata.namespace,KIND:.kind,NAME:.metadata.name,READY:.status.readyReplicas,SPEC:.spec.replicas \
+            --no-headers 2>/dev/null || true
+        $KUBE_CMD get sts -A -o custom-columns=\
+NAMESPACE:.metadata.namespace,KIND:.kind,NAME:.metadata.name,READY:.status.readyReplicas,SPEC:.spec.replicas \
+            --no-headers 2>/dev/null || true
+        $KUBE_CMD get ds -A -o custom-columns=\
+NAMESPACE:.metadata.namespace,KIND:.kind,NAME:.metadata.name,READY:.status.numberReady,SPEC:.status.desiredNumberScheduled \
+            --no-headers 2>/dev/null || true
+    } | awk '{
+        ready=($4==""?0:$4);
+        spec=($5==""?0:$5);
+        if (ready < spec) {print $0}
+    }' | {
+        read -r first_line
+        if [ -n "${first_line:-}" ]; then
+            printf "%s\n" "$first_line"
+            cat
+        else
+            echo -e "${STATUS_OK} All major workloads appear balanced."
+        fi
+    }
 
     print_sub_header "Pods NOT in 'Running' or 'Completed' state (Top 30)"
     $KUBE_CMD get pods -A --field-selector status.phase!=Running,status.phase!=Succeeded \
@@ -267,7 +280,7 @@ run_snapshot() {
     fi
 
     print_sub_header "Persistent Volume Claims (PVCs) Not Bound"
-    PVC_NON_BOUND=$($KUBE_CMD get pvc -A --no-headers 2>/dev/null | awk '$2 != "Bound"' || true)
+    PVC_NON_BOUND=$($KUBE_CMD get pvc -A --no-headers 2>/dev/null | awk '$3=="Pending" || $3=="Lost" || $3=="Failed"' || true)
     if [ -z "$PVC_NON_BOUND" ]; then
         echo -e "${STATUS_OK} All PVCs are Bound."
     else
@@ -296,7 +309,6 @@ run_snapshot() {
     # --- Section 8: etcd Diagnostics ---
     print_header "8. Etcd Cluster Health"
     print_etcd_operator_status
-    print_etcd_api_health
     print_etcd_cluster_health
 
     # --- Section 9: VolumeSnapshots older than 7 days ---
