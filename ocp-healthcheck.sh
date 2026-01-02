@@ -261,7 +261,7 @@ NAMESPACE:.metadata.namespace,KIND:.kind,NAME:.metadata.name,READY:.status.numbe
         else
             echo -e "${STATUS_OK} All major workloads appear balanced."
         fi
-    }
+    } || echo -e "${STATUS_WARN} Unable to evaluate workload status."
 
     print_sub_header "Pods NOT in 'Running' or 'Completed' state (Top 30)"
     $KUBE_CMD get pods -A --field-selector status.phase!=Running,status.phase!=Succeeded \
