@@ -4,7 +4,7 @@
 # K8s/OCP Cluster Incident Snapshot Script
 #
 # Description: Provides a comprehensive, color-coded, live view of cluster health,
-# with detailed etcd diagnostics and VolumeSnapshot age checks.
+# with detailed etcd cluster health checks and VolumeSnapshot age checks.
 # Supports both standard Kubernetes (kubectl) and OpenShift (oc).
 #
 # Usage: ./ocp-healthcheck.sh [options]
@@ -101,44 +101,6 @@ strip_colors() {
 
 # --- Diagnostic Helpers ---
 
-print_etcd_diagnostics_namespace() {
-    local namespace="$1"
-    local label_selector="$2"
-
-    print_sub_header "etcd Pods & Health (${namespace})"
-    if ! $KUBE_CMD get ns "${namespace}" &> /dev/null; then
-        echo -e "${STATUS_WARN} Namespace '${namespace}' not found. Skipping."
-        return
-    fi
-
-    $KUBE_CMD get pods -n "${namespace}" -l "${label_selector}" -o wide 2>/dev/null || \
-        echo -e "${STATUS_WARN} Unable to list etcd pods in ${namespace}."
-
-    print_sub_header "etcd Pod Readiness (Not Ready)"
-    $KUBE_CMD get pods -n "${namespace}" -l "${label_selector}" \
-        --field-selector=status.phase!=Running -o wide 2>/dev/null || \
-        echo -e "${STATUS_OK} No non-running etcd pods detected in ${namespace}."
-
-    print_sub_header "etcd Pod Describe (First 3)"
-    $KUBE_CMD get pods -n "${namespace}" -l "${label_selector}" --no-headers 2>/dev/null | \
-        awk 'NR<=3 {print $1}' | \
-        while read -r pod; do
-            echo -e "${BOLD}# $pod${NC}"
-            $KUBE_CMD describe pod -n "${namespace}" "$pod" | sed -n '1,120p'
-            echo
-        done || true
-
-    print_sub_header "etcd Pod Logs (Tail 200, First 3 Pods)"
-    $KUBE_CMD get pods -n "${namespace}" -l "${label_selector}" --no-headers 2>/dev/null | \
-        awk 'NR<=3 {print $1}' | \
-        while read -r pod; do
-            echo -e "${BOLD}# $pod${NC}"
-            $KUBE_CMD logs -n "${namespace}" "$pod" --tail=200 2>/dev/null || \
-                echo -e "${STATUS_WARN} Unable to read logs for $pod (permissions or container name)."
-            echo
-        done || true
-}
-
 print_etcd_api_health() {
     print_sub_header "API Server etcd Health Endpoints"
     $KUBE_CMD get --raw='/healthz/etcd' 2>/dev/null || \
@@ -153,6 +115,74 @@ print_etcd_operator_status() {
         oc get co etcd 2>/dev/null || echo -e "${STATUS_WARN} Unable to read ClusterOperator etcd."
         oc get etcd -n openshift-etcd 2>/dev/null || true
     fi
+}
+
+print_etcd_cluster_health() {
+    print_sub_header "etcd Cluster Status (etcdctl via Pod Exec)"
+
+    if [ "$IS_OPENSHIFT" != true ]; then
+        echo -e "${STATUS_WARN} OpenShift etcd pod exec is not available outside OpenShift. Skipping."
+        return
+    fi
+
+    if ! $KUBE_CMD get ns openshift-etcd &> /dev/null; then
+        echo -e "${STATUS_WARN} Namespace 'openshift-etcd' not found. Skipping."
+        return
+    fi
+
+    local etcd_pod
+    etcd_pod=$($KUBE_CMD get pods -n openshift-etcd -l app=etcd \
+        -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null | head -n 1)
+
+    if [ -z "$etcd_pod" ]; then
+        echo -e "${STATUS_WARN} No running etcd pod found in openshift-etcd."
+        return
+    fi
+
+    $KUBE_CMD exec -n openshift-etcd "$etcd_pod" -c etcd-member -- /bin/bash -c \
+        "etcdctl member list -w table; echo; etcdctl endpoint health --cluster; echo; etcdctl endpoint status -w table" \
+        2>/dev/null || echo -e "${STATUS_WARN} Unable to run etcdctl (RBAC or certs issue)."
+}
+
+print_ceph_status() {
+    print_sub_header "Ceph / ODF Cluster Health & Capacity"
+
+    if [ "$IS_OPENSHIFT" != true ]; then
+        echo -e "${STATUS_WARN} Ceph/ODF checks are OpenShift-specific. Skipping."
+        return
+    fi
+
+    if ! $KUBE_CMD get ns openshift-storage &> /dev/null; then
+        echo -e "${STATUS_WARN} Namespace 'openshift-storage' not found. Skipping."
+        return
+    fi
+
+    local toolbox_pod
+    toolbox_pod=$($KUBE_CMD get pod -n openshift-storage -l app=rook-ceph-tools \
+        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+    if [ -n "$toolbox_pod" ]; then
+        $KUBE_CMD exec -n openshift-storage "$toolbox_pod" -- /bin/bash -c \
+            "ceph -s; echo; ceph osd status; echo; ceph df" 2>/dev/null || \
+            echo -e "${STATUS_WARN} Unable to run ceph commands in rook-ceph-tools."
+        return
+    fi
+
+    echo -e "${STATUS_WARN} rook-ceph-tools pod not found; falling back to CephCluster details."
+    oc get cephcluster -n openshift-storage -o yaml 2>/dev/null || \
+        echo -e "${STATUS_WARN} Unable to read CephCluster resources."
+}
+
+print_loki_status() {
+    print_sub_header "Loki (Logging) Components"
+
+    if ! $KUBE_CMD get ns openshift-logging &> /dev/null; then
+        echo -e "${STATUS_WARN} Namespace 'openshift-logging' not found. Skipping."
+        return
+    fi
+
+    $KUBE_CMD get pods -n openshift-logging -l component=loki -o wide 2>/dev/null || \
+        echo -e "${STATUS_WARN} Unable to list Loki pods."
 }
 
 print_volumesnapshot_older_than_week() {
@@ -236,8 +266,20 @@ run_snapshot() {
         $KUBE_CMD get ingress -A --sort-by=.metadata.namespace 2>/dev/null || echo "Unable to list ingresses."
     fi
 
-    print_sub_header "Persistent Volume Claims (PVCs) Status"
-    $KUBE_CMD get pvc -A --sort-by=.status.phase 2>/dev/null || echo "Unable to list PVCs."
+    print_sub_header "Persistent Volume Claims (PVCs) Not Bound"
+    PVC_NON_BOUND=$($KUBE_CMD get pvc -A --no-headers 2>/dev/null | awk '$2 != "Bound"' || true)
+    if [ -z "$PVC_NON_BOUND" ]; then
+        echo -e "${STATUS_OK} All PVCs are Bound."
+    else
+        echo -e "NAMESPACE\tNAME\tSTATUS\tVOLUME\tCAPACITY\tACCESS MODES\tSTORAGECLASS\tAGE"
+        echo "$PVC_NON_BOUND"
+    fi
+
+    print_sub_header "Ceph / ODF Storage"
+    print_ceph_status
+
+    print_sub_header "Loki (Logging) Status"
+    print_loki_status
 
     # --- Section 6: Custom Resources ---
     print_header "6. Custom Resource Definitions (CRDs)"
@@ -252,13 +294,10 @@ run_snapshot() {
         echo "Unable to list events."
 
     # --- Section 8: etcd Diagnostics ---
-    print_header "8. Etcd Diagnostics (Detailed for Troubleshooting)"
+    print_header "8. Etcd Cluster Health"
     print_etcd_operator_status
     print_etcd_api_health
-
-    # OpenShift etcd runs in openshift-etcd; upstream often in kube-system.
-    print_etcd_diagnostics_namespace "openshift-etcd" "app=etcd"
-    print_etcd_diagnostics_namespace "kube-system" "component=etcd"
+    print_etcd_cluster_health
 
     # --- Section 9: VolumeSnapshots older than 7 days ---
     print_volumesnapshot_older_than_week
