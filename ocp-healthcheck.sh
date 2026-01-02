@@ -255,8 +255,7 @@ NAMESPACE:.metadata.namespace,KIND:.kind,NAME:.metadata.name,READY:.status.numbe
         spec=($5==""?0:$5);
         if (ready < spec) {print $0}
     }' | {
-        read -r first_line
-        if [ -n "${first_line:-}" ]; then
+        if read -r first_line; then
             printf "%s\n" "$first_line"
             cat
         else
